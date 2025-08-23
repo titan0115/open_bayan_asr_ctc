@@ -1,0 +1,7 @@
+data/
+python/
+venv/
+*.pyc
+runs/
+*.pth
+.venv/
