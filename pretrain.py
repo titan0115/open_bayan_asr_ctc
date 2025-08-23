@@ -5,6 +5,8 @@ from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
 import torchaudio
 import random
+import librosa
+import numpy as np
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder
@@ -12,7 +14,7 @@ from loss import ContrastiveLoss
 
 # ===== ГИПЕРПАРАМЕТРЫ =====
 # Пути
-DATASET_PATH = "./data/audio_files"  # Путь к корневой папке с аудиофайлами
+DATASET_PATH = "./data"  # Путь к корневой папке с аудиофайлами
 SAVE_PATH = "./checkpoints"  # Папка для сохранения чекпоинтов
 
 # Гиперпараметры модели
@@ -23,7 +25,7 @@ N_LAYERS = 12  # Количество слоев трансформера
 # Гиперпараметры обучения
 EPOCHS = 50  # Количество эпох
 BATCH_SIZE = 8  # Размер батча
-LEARNING_RATE = 1e-5  # Скорость обучения
+LEARNING_RATE = 1e-4  # Скорость обучения
 TEMPERATURE = 0.1  # Температура для Contrastive Loss
 # =========================
 
@@ -41,14 +43,18 @@ class UnsupervisedAudioDataset(Dataset):
     def __getitem__(self, idx):
         filepath = self.files[idx]
         try:
-            waveform, sr = torchaudio.load(filepath)
+            # Сначала пробуем torchaudio
+            try:
+                waveform, sr = torchaudio.load(filepath)
+                if waveform.size(0) > 1:
+                    waveform = torch.mean(waveform, dim=0, keepdim=True)
+                if sr != self.target_sr:
+                    waveform = torchaudio.transforms.Resample(sr, self.target_sr)(waveform)
+            except:
+                # Если torchaudio не работает, используем librosa
+                waveform, sr = librosa.load(str(filepath), sr=self.target_sr, mono=True)
+                waveform = torch.tensor(waveform).unsqueeze(0)
             
-            # Преобразование в моно и нужную частоту дискретизации
-            if waveform.size(0) > 1:
-                waveform = torch.mean(waveform, dim=0, keepdim=True)
-            if sr != self.target_sr:
-                waveform = torchaudio.transforms.Resample(sr, self.target_sr)(waveform)
-
             # Вырезаем случайный сегмент
             if waveform.size(1) > self.segment_len:
                 start = random.randint(0, waveform.size(1) - self.segment_len)
@@ -57,10 +63,15 @@ class UnsupervisedAudioDataset(Dataset):
             return waveform.squeeze(0)
         except Exception as e:
             print(f"Ошибка при загрузке файла {filepath}: {e}")
-            return self.__getitem__(random.randint(0, len(self) - 1)) # Пробуем другой файл
+            # Возвращаем нулевой тензор вместо рекурсивного вызова
+            return torch.zeros(self.segment_len)
 
 def collate_fn_pretrain(batch):
-    waveforms = [item for item in batch]
+    # Фильтруем нулевые тензоры (неудачные загрузки)
+    waveforms = [item for item in batch if torch.sum(torch.abs(item)) > 0]
+    if not waveforms:
+        # Если все файлы не удалось загрузить, возвращаем нулевой батч
+        return torch.zeros(1, 80000)  # 5 секунд при 16kHz
     padded_waveforms = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
     return padded_waveforms
 
@@ -105,6 +116,10 @@ def main():
         model.train()
         total_loss = 0
         for i, waveforms in enumerate(dataloader):
+            # Пропускаем батчи с нулевыми данными
+            if torch.sum(torch.abs(waveforms)) == 0:
+                continue
+                
             waveforms = waveforms.to(device)
             
             optimizer.zero_grad()
@@ -130,18 +145,17 @@ def main():
             transformer_output = model.transformer_encoder(pos_encoded) # -> [B, T_reduced, d_model]
             
             # Выбираем выходы и цели только для замаскированных позиций
-            transformer_masked_outputs = transformer_output[mask.transpose(0, 1)]
-            cnn_masked_targets = cnn_features.transpose(1, 2)[mask.transpose(0, 1)]
+            # Правильная индексация: mask имеет размер [batch_size, seq_len]
+            transformer_masked_outputs = transformer_output[mask]  # [num_masked, d_model]
+            cnn_masked_targets = cnn_features.transpose(1, 2)[mask]  # [num_masked, 512]
 
-            if transformer_masked_outputs.size(0) == 0: continue # если ничего не замаскировалось
+            if transformer_masked_outputs.size(0) == 0: 
+                continue # если ничего не замаскировалось
 
-            # Нужно reshape, чтобы было [Batch_effective, 1, Dim]
-            # Это усложнение. Давайте упростим: будем сравнивать все выходы
-            transformer_masked_outputs = transformer_output.view(-1, D_MODEL)[mask.flatten()]
-            cnn_masked_targets = cnn_features.transpose(1, 2).reshape(-1, 512)[mask.flatten()]
             # Для cnn_masked_targets нужна проекция в d_model
             projected_targets = model.input_projection(cnn_masked_targets)
 
+            # Добавляем batch dimension для функции потерь
             loss = criterion(transformer_masked_outputs.unsqueeze(0), projected_targets.unsqueeze(0))
 
             loss.backward()
