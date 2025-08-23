@@ -5,11 +5,22 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
 import torchaudio
-import argparse
 import pandas as pd
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder, CTClassificationHead, ASRModel
+
+# ===== ГИПЕРПАРАМЕТРЫ =====
+# Пути
+DATASET_PATH = "./data/finetune_dataset"  # Путь к папке с размеченными данными (metadata.csv и audio_files/)
+PRETRAINED_CHECKPOINT = "./checkpoints/pretrained_encoder_epoch_50.pt"  # Путь к файлу с весами предобученного энкодера
+SAVE_PATH = "./finetuned_model"  # Папка для сохранения финальной модели
+
+# Гиперпараметры обучения
+EPOCHS = 100  # Количество эпох
+BATCH_SIZE = 16  # Размер батча
+LEARNING_RATE = 3e-4  # Скорость обучения
+# =========================
 
 # Определяем словарь (важно, чтобы 0 был BLANK символом для CTC)
 VOCAB = ["_"] + list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя") + [" "]
@@ -50,20 +61,20 @@ def collate_fn_finetune(batch):
     
     return padded_waveforms, waveform_lengths, padded_labels, label_lengths
 
-def main(args):
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
 
     # 1. Данные
-    dataset_path = Path(args.dataset_path)
+    dataset_path = Path(DATASET_PATH)
     dataset = SupervisedAudioDataset(dataset_path / 'metadata.csv', dataset_path / 'audio_files')
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, 
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
                             collate_fn=collate_fn_finetune, num_workers=4)
 
     # 2. Модель
     encoder = CustomSpeechEncoder()
     # Загружаем веса из предобученной модели
-    encoder.load_state_dict(torch.load(args.pretrained_checkpoint, map_location=device))
+    encoder.load_state_dict(torch.load(PRETRAINED_CHECKPOINT, map_location=device))
     print("Веса предобученного энкодера загружены.")
     
     head = CTClassificationHead(vocab_size=len(VOCAB))
@@ -71,10 +82,10 @@ def main(args):
 
     # 3. Функция потерь (встроена в PyTorch) и оптимизатор
     criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     # 4. Цикл обучения
-    for epoch in range(args.epochs):
+    for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
         for i, (waveforms, wave_lens, labels, label_lens) in enumerate(dataloader):
@@ -100,25 +111,14 @@ def main(args):
             
             total_loss += loss.item()
             if (i+1) % 10 == 0:
-                print(f"Эпоха [{epoch+1}/{args.epochs}], Шаг [{i+1}/{len(dataloader)}], Потери: {loss.item():.4f}")
+                print(f"Эпоха [{epoch+1}/{EPOCHS}], Шаг [{i+1}/{len(dataloader)}], Потери: {loss.item():.4f}")
 
         print(f"Средние потери за эпоху {epoch+1}: {total_loss / len(dataloader):.4f}")
 
     # Сохранение финальной модели
-    torch.save(model.state_dict(), f"{args.save_path}/finetuned_asr_model.pt")
-    print(f"Финальная модель сохранена в {args.save_path}/finetuned_asr_model.pt")
+    torch.save(model.state_dict(), f"{SAVE_PATH}/finetuned_asr_model.pt")
+    print(f"Финальная модель сохранена в {SAVE_PATH}/finetuned_asr_model.pt")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Скрипт дообучения модели ASR")
-    parser.add_argument('--dataset_path', type=str, required=True, help='Путь к папке с размеченными данными (metadata.csv и audio_files/)')
-    parser.add_argument('--pretrained_checkpoint', type=str, required=True, help='Путь к файлу с весами предобученного энкодера (.pt)')
-    parser.add_argument('--save_path', type=str, default='./finetuned_model', help='Папка для сохранения финальной модели')
-    
-    # Гиперпараметры обучения
-    parser.add_argument('--epochs', type=int, default=100, help='Количество эпох')
-    parser.add_argument('--batch_size', type=int, default=16, help='Размер батча')
-    parser.add_argument('--learning_rate', type=float, default=3e-4, help='Скорость обучения')
-    
-    args = parser.parse_args()
-    Path(args.save_path).mkdir(exist_ok=True, parents=True)
-    main(args)
+    Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
+    main()

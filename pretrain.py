@@ -4,12 +4,28 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from pathlib import Path
 import torchaudio
-import argparse
 import random
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder
 from loss import ContrastiveLoss
+
+# ===== ГИПЕРПАРАМЕТРЫ =====
+# Пути
+DATASET_PATH = "./data/audio_files"  # Путь к корневой папке с аудиофайлами
+SAVE_PATH = "./checkpoints"  # Папка для сохранения чекпоинтов
+
+# Гиперпараметры модели
+D_MODEL = 768  # Размерность модели трансформера
+N_HEAD = 12  # Количество голов во внимании
+N_LAYERS = 12  # Количество слоев трансформера
+
+# Гиперпараметры обучения
+EPOCHS = 50  # Количество эпох
+BATCH_SIZE = 8  # Размер батча
+LEARNING_RATE = 1e-5  # Скорость обучения
+TEMPERATURE = 0.1  # Температура для Contrastive Loss
+# =========================
 
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3'}
 
@@ -66,26 +82,26 @@ def apply_mask(cnn_features, mask_prob=0.15, mask_length=10):
     return masked_features, mask
 
 
-def main(args):
+def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Используется устройство: {device}")
 
     # 1. Данные
-    dataset = UnsupervisedAudioDataset(Path(args.dataset_path))
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=True, 
+    dataset = UnsupervisedAudioDataset(Path(DATASET_PATH))
+    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
                             collate_fn=collate_fn_pretrain, num_workers=4)
 
     # 2. Модель
     model = CustomSpeechEncoder(
-        d_model=args.d_model, n_head=args.n_head, n_layers=args.n_layers
+        d_model=D_MODEL, n_head=N_HEAD, n_layers=N_LAYERS
     ).to(device)
 
     # 3. Функция потерь и оптимизатор
-    criterion = ContrastiveLoss(temperature=args.temperature).to(device)
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    criterion = ContrastiveLoss(temperature=TEMPERATURE).to(device)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
     # 4. Цикл обучения
-    for epoch in range(args.epochs):
+    for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
         for i, waveforms in enumerate(dataloader):
@@ -121,7 +137,7 @@ def main(args):
 
             # Нужно reshape, чтобы было [Batch_effective, 1, Dim]
             # Это усложнение. Давайте упростим: будем сравнивать все выходы
-            transformer_masked_outputs = transformer_output.view(-1, args.d_model)[mask.flatten()]
+            transformer_masked_outputs = transformer_output.view(-1, D_MODEL)[mask.flatten()]
             cnn_masked_targets = cnn_features.transpose(1, 2).reshape(-1, 512)[mask.flatten()]
             # Для cnn_masked_targets нужна проекция в d_model
             projected_targets = model.input_projection(cnn_masked_targets)
@@ -133,29 +149,13 @@ def main(args):
             
             total_loss += loss.item()
             if (i+1) % 10 == 0:
-                print(f"Эпоха [{epoch+1}/{args.epochs}], Шаг [{i+1}/{len(dataloader)}], Потери: {loss.item():.4f}")
+                print(f"Эпоха [{epoch+1}/{EPOCHS}], Шаг [{i+1}/{len(dataloader)}], Потери: {loss.item():.4f}")
 
         print(f"Средние потери за эпоху {epoch+1}: {total_loss / len(dataloader):.4f}")
 
         # Сохранение чекпоинта
-        torch.save(model.state_dict(), f"{args.save_path}/pretrained_encoder_epoch_{epoch+1}.pt")
+        torch.save(model.state_dict(), f"{SAVE_PATH}/pretrained_encoder_epoch_{epoch+1}.pt")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Скрипт предобучения модели ASR")
-    parser.add_argument('--dataset_path', type=str, required=True, help='Путь к корневой папке с аудиофайлами')
-    parser.add_argument('--save_path', type=str, default='./checkpoints', help='Папка для сохранения чекпоинтов')
-    
-    # Гиперпараметры модели
-    parser.add_argument('--d_model', type=int, default=768, help='Размерность модели трансформера')
-    parser.add_argument('--n_head', type=int, default=12, help='Количество голов во внимании')
-    parser.add_argument('--n_layers', type=int, default=12, help='Количество слоев трансформера')
-
-    # Гиперпараметры обучения
-    parser.add_argument('--epochs', type=int, default=50, help='Количество эпох')
-    parser.add_argument('--batch_size', type=int, default=8, help='Размер батча')
-    parser.add_argument('--learning_rate', type=float, default=1e-5, help='Скорость обучения')
-    parser.add_argument('--temperature', type=float, default=0.1, help='Температура для Contrastive Loss')
-
-    args = parser.parse_args()
-    Path(args.save_path).mkdir(exist_ok=True, parents=True)
-    main(args)
+    Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
+    main()
