@@ -8,8 +8,8 @@ import argparse
 import random
 
 # Импортируем наши модули
-from model_architecture import CustomSpeechEncoder
-from loss_functions import ContrastiveLoss
+from model import CustomSpeechEncoder
+from loss import ContrastiveLoss
 
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3'}
 

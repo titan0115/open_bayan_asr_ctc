@@ -9,7 +9,7 @@ import argparse
 import pandas as pd
 
 # Импортируем наши модули
-from model_architecture import CustomSpeechEncoder, CTClassificationHead, ASRModel
+from model import CustomSpeechEncoder, CTClassificationHead, ASRModel
 
 # Определяем словарь (важно, чтобы 0 был BLANK символом для CTC)
 VOCAB = ["_"] + list("абвгдеёжзийклмнопрстуфхцчшщъыьэюя") + [" "]
