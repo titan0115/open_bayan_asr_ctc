@@ -43,8 +43,8 @@ class ContrastiveLoss(nn.Module):
         negatives = torch.stack(negative_samples) # -> [B*Num_Masked, Num_Negatives, Dim]
 
         # Вычисляем косинусное сходство для негативных пар
-        # [B*Num_Masked, 1, Dim] @ [B*Num_Masked, Dim, Num_Negatives] -> [B*Num_Masked, 1, Num_Negatives]
-        negative_similarity = F.cosine_similarity(preds.unsqueeze(1), negatives.transpose(1, 2), dim=2)
+        # Правильный способ: вычисляем сходство между preds и каждым негативным примером
+        negative_similarity = F.cosine_similarity(preds.unsqueeze(1), negatives, dim=2)
 
         # Объединяем позитивное и негативное сходство
         # [B*Num_Masked, 1 + Num_Negatives]
