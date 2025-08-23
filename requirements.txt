@@ -1,0 +1,9 @@
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch 
+torchvision 
+
+tensorboard
+tqdm
+Pillow
+numpy
+scikit-learn
