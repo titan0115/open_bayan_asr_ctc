@@ -1,7 +1,10 @@
+
 # 3_pretrain.py
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+# <--- ИСПРАВЛЕНИЕ: Добавлен недостающий импорт
+import torch.amp as amp
 from pathlib import Path
 import torchaudio
 import random
@@ -13,22 +16,23 @@ from model import CustomSpeechEncoder
 from loss import ContrastiveLoss
 
 # ===== ГИПЕРПАРАМЕТРЫ =====
-# Пути
-DATASET_PATH = "./data"  # Путь к корневой папке с аудиофайлами
-SAVE_PATH = "./checkpoints"  # Папка для сохранения чекпоинтов
-
-# Гиперпараметры модели
-D_MODEL = 768  # Размерность модели трансформера
-N_HEAD = 12  # Количество голов во внимании
-N_LAYERS = 12  # Количество слоев трансформера
-
-# Гиперпараметры обучения
-EPOCHS = 50  # Количество эпох
-BATCH_SIZE = 8  # Размер батча
-LEARNING_RATE = 1e-4  # Скорость обучения
-TEMPERATURE = 0.1  # Температура для Contrastive Loss
+DATASET_PATH = "./data"
+SAVE_PATH = "./checkpoints"
+D_MODEL = 768
+N_HEAD = 12
+N_LAYERS = 12
+EPOCHS = 50
+BATCH_SIZE = 16
+LEARNING_RATE = 1e-4
+TEMPERATURE = 0.1
+USE_AMP = True
+USE_CHECKPOINTING = True
+SEED = 42
 # =========================
 
+torch.manual_seed(SEED)
+np.random.seed(SEED)
+random.seed(SEED)
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3'}
 
 class UnsupervisedAudioDataset(Dataset):
@@ -43,19 +47,16 @@ class UnsupervisedAudioDataset(Dataset):
     def __getitem__(self, idx):
         filepath = self.files[idx]
         try:
-            # Сначала пробуем torchaudio
             try:
                 waveform, sr = torchaudio.load(filepath)
                 if waveform.size(0) > 1:
                     waveform = torch.mean(waveform, dim=0, keepdim=True)
                 if sr != self.target_sr:
                     waveform = torchaudio.transforms.Resample(sr, self.target_sr)(waveform)
-            except:
-                # Если torchaudio не работает, используем librosa
+            except Exception:
                 waveform, sr = librosa.load(str(filepath), sr=self.target_sr, mono=True)
-                waveform = torch.tensor(waveform).unsqueeze(0)
+                waveform = torch.from_numpy(waveform).unsqueeze(0)
             
-            # Вырезаем случайный сегмент
             if waveform.size(1) > self.segment_len:
                 start = random.randint(0, waveform.size(1) - self.segment_len)
                 waveform = waveform[:, start:start+self.segment_len]
@@ -63,23 +64,18 @@ class UnsupervisedAudioDataset(Dataset):
             return waveform.squeeze(0)
         except Exception as e:
             print(f"Ошибка при загрузке файла {filepath}: {e}")
-            # Возвращаем нулевой тензор вместо рекурсивного вызова
             return torch.zeros(self.segment_len)
 
 def collate_fn_pretrain(batch):
-    # Фильтруем нулевые тензоры (неудачные загрузки)
     waveforms = [item for item in batch if torch.sum(torch.abs(item)) > 0]
     if not waveforms:
-        # Если все файлы не удалось загрузить, возвращаем нулевой батч
-        return torch.zeros(1, 80000)  # 5 секунд при 16kHz
+        return None
     padded_waveforms = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
     return padded_waveforms
 
 def apply_mask(cnn_features, mask_prob=0.15, mask_length=10):
     batch_size, dim, seq_len = cnn_features.shape
-    
     mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=cnn_features.device)
-    
     num_mask_spans = int(mask_prob * seq_len / mask_length)
     
     for i in range(batch_size):
@@ -87,79 +83,53 @@ def apply_mask(cnn_features, mask_prob=0.15, mask_length=10):
             start = random.randint(0, max(0, seq_len - mask_length))
             mask[i, start:start+mask_length] = True
             
-    masked_features = cnn_features.clone()
-    masked_features.transpose(1, 2)[mask] = 0 # Зануляем замаскированные векторы
-    
-    return masked_features, mask
-
+    return mask
 
 def main():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_str)
     print(f"Используется устройство: {device}")
 
-    # 1. Данные
     dataset = UnsupervisedAudioDataset(Path(DATASET_PATH))
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                            collate_fn=collate_fn_pretrain, num_workers=4)
+                            collate_fn=collate_fn_pretrain, num_workers=4, pin_memory=True)
 
-    # 2. Модель
-    model = CustomSpeechEncoder(
-        d_model=D_MODEL, n_head=N_HEAD, n_layers=N_LAYERS
-    ).to(device)
+    model = CustomSpeechEncoder(d_model=D_MODEL, n_head=N_HEAD, n_layers=N_LAYERS).to(device)
 
-    # 3. Функция потерь и оптимизатор
     criterion = ContrastiveLoss(temperature=TEMPERATURE).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+    
+    scaler = amp.GradScaler(enabled=(USE_AMP and device.type == 'cuda'))
 
-    # 4. Цикл обучения
     for epoch in range(EPOCHS):
         model.train()
         total_loss = 0
         for i, waveforms in enumerate(dataloader):
-            # Пропускаем батчи с нулевыми данными
-            if torch.sum(torch.abs(waveforms)) == 0:
+            if waveforms is None:
                 continue
                 
             waveforms = waveforms.to(device)
+            optimizer.zero_grad(set_to_none=True)
             
-            optimizer.zero_grad()
-            
-            # Прямой проход
-            _, cnn_features = model(waveforms) # Нам нужны оба выхода
-            
-            # Маскирование
-            masked_cnn_features, mask = apply_mask(cnn_features)
-            
-            # Прогоняем замаскированные признаки через трансформер, чтобы получить предсказания
-            # Для этого нужно немного изменить модель или сделать второй проход.
-            # Для чистоты архитектуры - делаем второй проход.
-            # Эффективнее было бы изменить forward модели, чтобы она принимала cnn_features.
-            
-            # --- ВАРИАНТ 1: Второй проход (проще, но медленнее)
-            # Для этого надо переделать модель, чтобы она могла принимать фичи на вход
-            # Давайте для простоты предположим, что мы можем это сделать
-            
-            # --- ВАРИАНТ 2: Изменяем логику тут (практичнее для этого скрипта)
-            projected = model.input_projection(masked_cnn_features.transpose(1, 2))
-            pos_encoded = projected + model.positional_encoding[:, :projected.size(1), :]
-            transformer_output = model.transformer_encoder(pos_encoded) # -> [B, T_reduced, d_model]
-            
-            # Выбираем выходы и цели только для замаскированных позиций
-            # Правильная индексация: mask имеет размер [batch_size, seq_len]
-            transformer_masked_outputs = transformer_output[mask]  # [num_masked, d_model]
-            cnn_masked_targets = cnn_features.transpose(1, 2)[mask]  # [num_masked, 512]
+            with amp.autocast(device_type=device_str, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
+                # Единственный проход через модель, который возвращает все необходимое
+                transformer_output, cnn_features_true = model(waveforms, use_checkpointing=USE_CHECKPOINTING)
+                
+                mask = apply_mask(cnn_features_true)
 
-            if transformer_masked_outputs.size(0) == 0: 
-                continue # если ничего не замаскировалось
+                if not mask.any():
+                    continue
+                
+                transformer_masked_outputs = transformer_output[mask]
+                cnn_masked_targets = cnn_features_true.transpose(1, 2)[mask]
 
-            # Для cnn_masked_targets нужна проекция в d_model
-            projected_targets = model.input_projection(cnn_masked_targets)
+                projected_targets = model.input_projection(cnn_masked_targets)
 
-            # Добавляем batch dimension для функции потерь
-            loss = criterion(transformer_masked_outputs.unsqueeze(0), projected_targets.unsqueeze(0))
+                loss = criterion(transformer_masked_outputs.unsqueeze(0), projected_targets.unsqueeze(0))
 
-            loss.backward()
-            optimizer.step()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             total_loss += loss.item()
             if (i+1) % 10 == 0:
@@ -167,9 +137,8 @@ def main():
 
         print(f"Средние потери за эпоху {epoch+1}: {total_loss / len(dataloader):.4f}")
 
-        # Сохранение чекпоинта
+        Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
         torch.save(model.state_dict(), f"{SAVE_PATH}/pretrained_encoder_epoch_{epoch+1}.pt")
 
 if __name__ == "__main__":
-    Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
     main()
