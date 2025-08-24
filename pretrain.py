@@ -224,7 +224,6 @@ def main():
         'use_amp': USE_AMP,
         'num_workers': NUM_WORKERS
     }
-    writer.add_hparams(hparams, {'hparam/accuracy': 0.0})
     
     global_step = 0
 
@@ -310,6 +309,15 @@ def main():
         Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
         torch.save(model.state_dict(), f"{SAVE_PATH}/pretrained_encoder_epoch_{epoch+1}.pt")
 
+        # НОВОЕ: Добавляем явную очистку в конце эпохи
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    # Записываем финальную среднюю потерю в гиперпараметры
+    final_avg_loss = total_loss / len(dataloader)
+    writer.add_hparams(hparams, {'hparam/final_avg_loss': final_avg_loss})
+    
     # Закрываем TensorBoard writer
     writer.close()
     print(f"TensorBoard логи сохранены в {TENSORBOARD_LOG_DIR}")
