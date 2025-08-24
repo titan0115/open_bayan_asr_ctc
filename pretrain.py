@@ -1,6 +1,6 @@
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Sampler
 import torch.amp as amp
 from torch.optim.lr_scheduler import LambdaLR
 from pathlib import Path
@@ -29,10 +29,6 @@ USE_AMP = True
 USE_CHECKPOINTING = True
 SEED = 42
 
-# НОВОЕ: Параметры для оптимизации паддинга
-USE_LENGTH_GROUPING = True  # Использовать группировку файлов по длинам
-MAX_LENGTH_DIFF_RATIO = 0.1  # Максимальная разница в длинах файлов в группе (10%)
-
 # Параметры загрузки данных
 NUM_WORKERS = 4  # Количество воркеров для загрузки данных
 PIN_MEMORY = True  # Использовать закрепленную память для ускорения передачи на GPU
@@ -48,34 +44,67 @@ np.random.seed(SEED)
 random.seed(SEED)
 AUDIO_EXTENSIONS = {'.wav', '.flac', '.mp3'}
 
+class LengthGroupedSampler(Sampler):
+    """
+    Сэмплер для группировки файлов по длинам для минимизации паддинга
+    """
+    def __init__(self, dataset, batch_size, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        
+        # Получаем длины всех файлов один раз
+        print("Анализ длин файлов для сэмплера...")
+        self.lengths = []
+        for f in tqdm(dataset.files, desc="Получение длин файлов"):
+            try:
+                info = torchaudio.info(str(f))
+                self.lengths.append(info.num_frames)
+            except Exception:
+                self.lengths.append(0)  # Пометим проблемные файлы
+        
+        # Создаем группы (бакеты) индексов
+        self.buckets = self._create_buckets()
+
+    def _create_buckets(self):
+        # Сортируем индексы по длинам, исключая проблемные файлы
+        valid_indices = [i for i, length in enumerate(self.lengths) if length > 0]
+        sorted_indices = sorted(valid_indices, key=lambda i: self.lengths[i])
+        
+        buckets = []
+        # Разбиваем отсортированные индексы на батчи
+        for i in range(0, len(sorted_indices), self.batch_size):
+            bucket = sorted_indices[i:i+self.batch_size]
+            if len(bucket) == self.batch_size:  # Только полные батчи
+                buckets.append(bucket)
+            
+        print(f"Создано {len(buckets)} батчей с группировкой по длинам")
+        return buckets
+
+    def __iter__(self):
+        # Перемешиваем порядок бакетов, если нужно
+        if self.shuffle:
+            random.shuffle(self.buckets)
+        
+        # Проходим по бакетам и выдаем индексы
+        for bucket in self.buckets:
+            # Можно дополнительно перемешать элементы внутри бакета
+            if self.shuffle:
+                random.shuffle(bucket)
+            yield from bucket
+
+    def __len__(self):
+        # Возвращаем общее количество элементов, а не количество батчей
+        return len(self.buckets) * self.batch_size
+
+
 class UnsupervisedAudioDataset(Dataset):
     def __init__(self, root_dir: Path, segment_duration_sec=5):
         self.files = [p for p in root_dir.rglob('*') if p.suffix.lower() in AUDIO_EXTENSIONS]
         self.target_sr = 16000
         self.segment_len = self.target_sr * segment_duration_sec
         
-        # НОВОЕ: Сортируем файлы по длительности для оптимизации паддинга
-        print("Сортировка файлов по длительности. Это может занять некоторое время...")
-        
-        # Получаем длительность каждого файла
-        file_lengths = []
-        for f in tqdm(self.files, desc="Получение длительности файлов"):
-            try:
-                # Более быстрый способ получить инфо без загрузки всего файла
-                info = torchaudio.info(str(f))
-                file_lengths.append(info.num_frames)
-            except Exception:
-                # Запасной вариант, если torchaudio.info не сработает
-                file_lengths.append(-1)  # Пометим проблемные файлы
-
-        # Соединяем файлы и их длины, сортируем, убираем проблемные
-        sorted_files_with_lengths = sorted(
-            [item for item in zip(self.files, file_lengths) if item[1] > 0],
-            key=lambda x: x[1]
-        )
-        self.files = [item[0] for item in sorted_files_with_lengths]
-        
-        print(f"Сортировка завершена. Обработано {len(self.files)} файлов.")
+        print(f"Найдено {len(self.files)} аудиофайлов")
 
     def __len__(self):
         return len(self.files)
@@ -124,69 +153,6 @@ def collate_fn_pretrain(batch):
     return padded_waveforms
 
 
-class LengthGroupedDataset(Dataset):
-    """
-    Обертка для группировки файлов по длинам для минимизации паддинга
-    """
-    def __init__(self, dataset, max_length_diff_ratio=0.1):
-        self.dataset = dataset
-        self.max_length_diff_ratio = max_length_diff_ratio
-        self.groups = self._create_groups()
-        
-    def _create_groups(self):
-        """Создает группы файлов с похожими длинами"""
-        print("Создание групп файлов по длинам...")
-        
-        # Получаем длины всех файлов
-        lengths = []
-        for i in tqdm(range(len(self.dataset)), desc="Анализ длин файлов"):
-            try:
-                filepath = self.dataset.files[i]
-                info = torchaudio.info(str(filepath))
-                lengths.append(info.num_frames)
-            except:
-                lengths.append(0)
-        
-        # Создаем группы
-        groups = []
-        current_group = []
-        current_max_length = 0
-        
-        for i, length in enumerate(lengths):
-            if length == 0:  # Пропускаем проблемные файлы
-                continue
-                
-            if not current_group:
-                current_group.append(i)
-                current_max_length = length
-            else:
-                # Проверяем, подходит ли файл к текущей группе
-                if length <= current_max_length * (1 + self.max_length_diff_ratio):
-                    current_group.append(i)
-                    current_max_length = max(current_max_length, length)
-                else:
-                    # Начинаем новую группу
-                    if current_group:
-                        groups.append(current_group)
-                    current_group = [i]
-                    current_max_length = length
-        
-        # Добавляем последнюю группу
-        if current_group:
-            groups.append(current_group)
-        
-        print(f"Создано {len(groups)} групп файлов")
-        return groups
-    
-    def __len__(self):
-        return len(self.groups)
-    
-    def __getitem__(self, idx):
-        # Возвращаем случайный файл из группы
-        group = self.groups[idx]
-        file_idx = random.choice(group)
-        return self.dataset[file_idx]
-
 def apply_mask(cnn_features, mask_prob=0.15, mask_length=10):
     batch_size, dim, seq_len = cnn_features.shape
     mask = torch.zeros(batch_size, seq_len, dtype=torch.bool, device=cnn_features.device)
@@ -204,22 +170,16 @@ def main():
     device = torch.device(device_str)
     print(f"Используется устройство: {device}")
 
-    # Создаем базовый датасет
-    base_dataset = UnsupervisedAudioDataset(Path(DATASET_PATH))
+    # Создаем датасет
+    dataset = UnsupervisedAudioDataset(Path(DATASET_PATH))
     
-    # НОВОЕ: Используем группировку по длинам для минимизации паддинга
-    # Можно выбрать один из двух подходов:
-    # 1. Простая сортировка (уже реализована в UnsupervisedAudioDataset)
-    # 2. Группировка по длинам (более эффективная, но медленнее инициализируется)
-    
-    if USE_LENGTH_GROUPING:
-        print("Используется группировка файлов по длинам...")
-        dataset = LengthGroupedDataset(base_dataset, max_length_diff_ratio=MAX_LENGTH_DIFF_RATIO)
-    else:
-        print("Используется простая сортировка файлов...")
-        dataset = base_dataset
-    
-    dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
+    # НОВОЕ: Используем LengthGroupedSampler для правильной группировки
+    sampler = LengthGroupedSampler(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+    dataloader = DataLoader(dataset, 
+                            sampler=sampler,  # Используем sampler, а не batch_sampler
+                            batch_size=BATCH_SIZE,  # Возвращаем batch_size
+                            shuffle=False,  # shuffle=False, так как сэмплер сам занимается перемешиванием
                             collate_fn=collate_fn_pretrain, 
                             num_workers=NUM_WORKERS, 
                             pin_memory=PIN_MEMORY,
