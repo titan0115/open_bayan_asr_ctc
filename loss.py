@@ -6,55 +6,50 @@ import torch.nn.functional as F
 class ContrastiveLoss(nn.Module):
     """
     Контрастивная функция потерь для self-supervised предобучения.
-    Задача: предсказание трансформера для замаскированного шага должно быть похоже 
-    на "истинный" выход CNN для этого шага и не похоже на выходы для других шагов.
+    Эффективная векторизованная реализация.
     """
     def __init__(self, temperature=0.1):
         super().__init__()
         self.temperature = temperature
 
-    def forward(self, transformer_outputs, cnn_targets, num_negatives=100):
+    def forward(self, transformer_outputs, cnn_targets):
         """
         Args:
             transformer_outputs (Tensor): Выход трансформера для замаскированных позиций [Batch, Num_Masked, Dim]
             cnn_targets (Tensor): "Истинные" векторы из CNN для тех же позиций [Batch, Num_Masked, Dim]
         """
-        batch_size, num_masked, dim = transformer_outputs.shape
+        # 1. Выпрямляем тензоры и нормализуем их для косинусного сходства
+        # Это делает вычисление более стабильным и эквивалентно F.cosine_similarity
+        preds = transformer_outputs.contiguous().view(-1, transformer_outputs.size(-1))
+        preds = F.normalize(preds, p=2, dim=1) # [N, Dim], где N = B * Num_Masked
+
+        targets = cnn_targets.contiguous().view(-1, cnn_targets.size(-1))
+        targets = F.normalize(targets, p=2, dim=1) # [N, Dim]
+
+        # 2. Вычисляем матрицу попарных сходств
+        # Результат - матрица [N, N], где sim_matrix[i, j] - сходство между i-м предсказанием и j-м таргетом
+        similarity_matrix = torch.matmul(preds, targets.T)
+
+        # 3. Находим позитивные и негативные примеры
+        # Позитивные примеры находятся на диагонали матрицы.
+        # Все остальные - негативные.
         
-        # Выпрямляем тензоры для удобства
-        preds = transformer_outputs.view(-1, dim) # [B * Num_Masked, Dim]
-        targets = cnn_targets.view(-1, dim) # [B * Num_Masked, Dim]
-
-        # Вычисляем косинусное сходство для позитивных пар (предсказание и его истинная цель)
-        positive_similarity = F.cosine_similarity(preds, targets, dim=-1) # -> [B * Num_Masked]
-
-        # Генерируем негативные примеры
-        # Для простоты берем случайные векторы из самого `cnn_targets`, но не совпадающие с истинным
-        total_samples = targets.size(0)
-        negative_samples = []
-        for i in range(total_samples):
-            # Создаем маску, чтобы не выбрать самого себя
-            mask = torch.ones(total_samples, dtype=torch.bool, device=preds.device)
-            mask[i] = False
-            # Выбираем `num_negatives` случайных индексов
-            neg_indices = torch.multinomial(mask.float(), num_negatives, replacement=True)
-            negative_samples.append(targets[neg_indices])
+        # Создаем маску для позитивных примеров (диагональ)
+        num_samples = preds.size(0)
+        device = preds.device
         
-        negatives = torch.stack(negative_samples) # -> [B*Num_Masked, Num_Negatives, Dim]
-
-        # Вычисляем косинусное сходство для негативных пар
-        # Правильный способ: вычисляем сходство между preds и каждым негативным примером
-        negative_similarity = F.cosine_similarity(preds.unsqueeze(1), negatives, dim=2)
-
-        # Объединяем позитивное и негативное сходство
-        # [B*Num_Masked, 1 + Num_Negatives]
-        logits = torch.cat([positive_similarity.unsqueeze(1), negative_similarity], dim=1)
+        # logits для InfoNCE loss
+        # Нам нужно сравнить каждое предсказание (строка) с его позитивным таргетом (на диагонали)
+        # и всеми остальными (негативными) таргетами в этой же строке.
         
+        # Метки для CrossEntropyLoss - это просто индексы диагональных элементов
+        labels = torch.arange(num_samples, device=device)
+
         # Применяем температуру
-        logits /= self.temperature
+        logits = similarity_matrix / self.temperature
         
-        # Целевые метки для CrossEntropyLoss - всегда 0, так как позитивный пример всегда первый
-        labels = torch.zeros(logits.size(0), dtype=torch.long, device=preds.device)
-        
+        # 4. Вычисляем CrossEntropyLoss
+        # Для каждого предсказания `preds[i]` мы хотим, чтобы `logits[i, i]` был максимальным.
         loss = F.cross_entropy(logits, labels)
+        
         return loss
