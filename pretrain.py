@@ -29,6 +29,10 @@ USE_AMP = True
 USE_CHECKPOINTING = True
 SEED = 42
 
+# НОВОЕ: Параметры для оптимизации паддинга
+USE_LENGTH_GROUPING = True  # Использовать группировку файлов по длинам
+MAX_LENGTH_DIFF_RATIO = 0.1  # Максимальная разница в длинах файлов в группе (10%)
+
 # Параметры загрузки данных
 NUM_WORKERS = 4  # Количество воркеров для загрузки данных
 PIN_MEMORY = True  # Использовать закрепленную память для ускорения передачи на GPU
@@ -49,6 +53,29 @@ class UnsupervisedAudioDataset(Dataset):
         self.files = [p for p in root_dir.rglob('*') if p.suffix.lower() in AUDIO_EXTENSIONS]
         self.target_sr = 16000
         self.segment_len = self.target_sr * segment_duration_sec
+        
+        # НОВОЕ: Сортируем файлы по длительности для оптимизации паддинга
+        print("Сортировка файлов по длительности. Это может занять некоторое время...")
+        
+        # Получаем длительность каждого файла
+        file_lengths = []
+        for f in tqdm(self.files, desc="Получение длительности файлов"):
+            try:
+                # Более быстрый способ получить инфо без загрузки всего файла
+                info = torchaudio.info(str(f))
+                file_lengths.append(info.num_frames)
+            except Exception:
+                # Запасной вариант, если torchaudio.info не сработает
+                file_lengths.append(-1)  # Пометим проблемные файлы
+
+        # Соединяем файлы и их длины, сортируем, убираем проблемные
+        sorted_files_with_lengths = sorted(
+            [item for item in zip(self.files, file_lengths) if item[1] > 0],
+            key=lambda x: x[1]
+        )
+        self.files = [item[0] for item in sorted_files_with_lengths]
+        
+        print(f"Сортировка завершена. Обработано {len(self.files)} файлов.")
 
     def __len__(self):
         return len(self.files)
@@ -79,8 +106,86 @@ def collate_fn_pretrain(batch):
     waveforms = [item for item in batch if torch.sum(torch.abs(item)) > 0]
     if not waveforms:
         return None
+    
+    # НОВОЕ: Логируем статистику длин для диагностики эффективности сортировки
+    lengths = [len(w) for w in waveforms]
+    if hasattr(collate_fn_pretrain, 'batch_count'):
+        collate_fn_pretrain.batch_count += 1
+    else:
+        collate_fn_pretrain.batch_count = 1
+    
+    # Логируем статистику каждые 100 батчей
+    if collate_fn_pretrain.batch_count % 100 == 0:
+        print(f"Батч {collate_fn_pretrain.batch_count}: длины {min(lengths)}-{max(lengths)}, "
+              f"средняя {sum(lengths)/len(lengths):.0f}, "
+              f"паддинг {(max(lengths) - min(lengths)) / max(lengths) * 100:.1f}%")
+    
     padded_waveforms = torch.nn.utils.rnn.pad_sequence(waveforms, batch_first=True)
     return padded_waveforms
+
+
+class LengthGroupedDataset(Dataset):
+    """
+    Обертка для группировки файлов по длинам для минимизации паддинга
+    """
+    def __init__(self, dataset, max_length_diff_ratio=0.1):
+        self.dataset = dataset
+        self.max_length_diff_ratio = max_length_diff_ratio
+        self.groups = self._create_groups()
+        
+    def _create_groups(self):
+        """Создает группы файлов с похожими длинами"""
+        print("Создание групп файлов по длинам...")
+        
+        # Получаем длины всех файлов
+        lengths = []
+        for i in tqdm(range(len(self.dataset)), desc="Анализ длин файлов"):
+            try:
+                filepath = self.dataset.files[i]
+                info = torchaudio.info(str(filepath))
+                lengths.append(info.num_frames)
+            except:
+                lengths.append(0)
+        
+        # Создаем группы
+        groups = []
+        current_group = []
+        current_max_length = 0
+        
+        for i, length in enumerate(lengths):
+            if length == 0:  # Пропускаем проблемные файлы
+                continue
+                
+            if not current_group:
+                current_group.append(i)
+                current_max_length = length
+            else:
+                # Проверяем, подходит ли файл к текущей группе
+                if length <= current_max_length * (1 + self.max_length_diff_ratio):
+                    current_group.append(i)
+                    current_max_length = max(current_max_length, length)
+                else:
+                    # Начинаем новую группу
+                    if current_group:
+                        groups.append(current_group)
+                    current_group = [i]
+                    current_max_length = length
+        
+        # Добавляем последнюю группу
+        if current_group:
+            groups.append(current_group)
+        
+        print(f"Создано {len(groups)} групп файлов")
+        return groups
+    
+    def __len__(self):
+        return len(self.groups)
+    
+    def __getitem__(self, idx):
+        # Возвращаем случайный файл из группы
+        group = self.groups[idx]
+        file_idx = random.choice(group)
+        return self.dataset[file_idx]
 
 def apply_mask(cnn_features, mask_prob=0.15, mask_length=10):
     batch_size, dim, seq_len = cnn_features.shape
@@ -99,7 +204,21 @@ def main():
     device = torch.device(device_str)
     print(f"Используется устройство: {device}")
 
-    dataset = UnsupervisedAudioDataset(Path(DATASET_PATH))
+    # Создаем базовый датасет
+    base_dataset = UnsupervisedAudioDataset(Path(DATASET_PATH))
+    
+    # НОВОЕ: Используем группировку по длинам для минимизации паддинга
+    # Можно выбрать один из двух подходов:
+    # 1. Простая сортировка (уже реализована в UnsupervisedAudioDataset)
+    # 2. Группировка по длинам (более эффективная, но медленнее инициализируется)
+    
+    if USE_LENGTH_GROUPING:
+        print("Используется группировка файлов по длинам...")
+        dataset = LengthGroupedDataset(base_dataset, max_length_diff_ratio=MAX_LENGTH_DIFF_RATIO)
+    else:
+        print("Используется простая сортировка файлов...")
+        dataset = base_dataset
+    
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
                             collate_fn=collate_fn_pretrain, 
                             num_workers=NUM_WORKERS, 
