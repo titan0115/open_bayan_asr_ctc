@@ -11,6 +11,7 @@ import random
 import librosa
 import numpy as np
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder
@@ -35,6 +36,9 @@ NUM_WORKERS = 4  # Количество воркеров для загрузки
 PIN_MEMORY = True  # Использовать закрепленную память для ускорения передачи на GPU
 PREFETCH_FACTOR = 2  # Количество батчей, предзагружаемых каждым воркером
 PERSISTENT_WORKERS = True  # Сохранять воркеров между эпохами
+
+# TensorBoard
+TENSORBOARD_LOG_DIR = "./runs/pretrain"
 # =========================
 
 torch.manual_seed(SEED)
@@ -112,6 +116,25 @@ def main():
     
     scaler = amp.GradScaler(enabled=(USE_AMP and device.type == 'cuda'))
 
+    # Инициализация TensorBoard
+    writer = SummaryWriter(TENSORBOARD_LOG_DIR)
+    
+    # Записываем гиперпараметры
+    hparams = {
+        'd_model': D_MODEL,
+        'n_head': N_HEAD,
+        'n_layers': N_LAYERS,
+        'batch_size': BATCH_SIZE,
+        'learning_rate': LEARNING_RATE,
+        'temperature': TEMPERATURE,
+        'epochs': EPOCHS,
+        'use_amp': USE_AMP,
+        'num_workers': NUM_WORKERS
+    }
+    writer.add_hparams(hparams, {'hparam/accuracy': 0.0})
+    
+    global_step = 0
+
     # Общий прогресс-бар для всех эпох
     epoch_pbar = tqdm(range(EPOCHS), desc="Обучение", unit="epoch")
     
@@ -157,8 +180,16 @@ def main():
                 'Loss': f'{loss.item():.4f}',
                 'Avg Loss': f'{total_loss / (i+1):.4f}'
             })
+            
+            # Записываем в TensorBoard
+            writer.add_scalar('Loss/Batch', loss.item(), global_step)
+            writer.add_scalar('Learning_Rate', LEARNING_RATE, global_step)
+            global_step += 1
 
         avg_loss = total_loss / len(dataloader)
+        
+        # Записываем средние потери за эпоху в TensorBoard
+        writer.add_scalar('Loss/Epoch', avg_loss, epoch + 1)
         
         # Обновляем общий прогресс-бар
         epoch_pbar.set_postfix({
@@ -168,6 +199,10 @@ def main():
 
         Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
         torch.save(model.state_dict(), f"{SAVE_PATH}/pretrained_encoder_epoch_{epoch+1}.pt")
+
+    # Закрываем TensorBoard writer
+    writer.close()
+    print(f"TensorBoard логи сохранены в {TENSORBOARD_LOG_DIR}")
 
 if __name__ == "__main__":
     main()
