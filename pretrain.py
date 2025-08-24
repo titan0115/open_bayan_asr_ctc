@@ -10,6 +10,7 @@ import torchaudio
 import random
 import librosa
 import numpy as np
+from tqdm import tqdm
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder
@@ -111,10 +112,18 @@ def main():
     
     scaler = amp.GradScaler(enabled=(USE_AMP and device.type == 'cuda'))
 
-    for epoch in range(EPOCHS):
+    # Общий прогресс-бар для всех эпох
+    epoch_pbar = tqdm(range(EPOCHS), desc="Обучение", unit="epoch")
+    
+    for epoch in epoch_pbar:
         model.train()
         total_loss = 0
-        for i, waveforms in enumerate(dataloader):
+        
+        # Создаем прогресс-бар для текущей эпохи
+        pbar = tqdm(dataloader, desc=f"Эпоха {epoch+1}/{EPOCHS}", 
+                   leave=False, unit="it")
+        
+        for i, waveforms in enumerate(pbar):
             if waveforms is None:
                 continue
                 
@@ -142,10 +151,20 @@ def main():
             scaler.update()
             
             total_loss += loss.item()
-            if (i+1) % 10 == 0:
-                print(f"Эпоха [{epoch+1}/{EPOCHS}], Шаг [{i+1}/{len(dataloader)}], Потери: {loss.item():.4f}")
+            
+            # Обновляем прогресс-бар с текущими потерями
+            pbar.set_postfix({
+                'Loss': f'{loss.item():.4f}',
+                'Avg Loss': f'{total_loss / (i+1):.4f}'
+            })
 
-        print(f"Средние потери за эпоху {epoch+1}: {total_loss / len(dataloader):.4f}")
+        avg_loss = total_loss / len(dataloader)
+        
+        # Обновляем общий прогресс-бар
+        epoch_pbar.set_postfix({
+            'Epoch': f'{epoch+1}/{EPOCHS}',
+            'Avg Loss': f'{avg_loss:.4f}'
+        })
 
         Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
         torch.save(model.state_dict(), f"{SAVE_PATH}/pretrained_encoder_epoch_{epoch+1}.pt")
