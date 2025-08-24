@@ -1,10 +1,8 @@
-
-# 3_pretrain.py
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-# <--- ИСПРАВЛЕНИЕ: Добавлен недостающий импорт
 import torch.amp as amp
+from torch.optim.lr_scheduler import LambdaLR
 from pathlib import Path
 import torchaudio
 import random
@@ -114,6 +112,17 @@ def main():
     criterion = ContrastiveLoss(temperature=TEMPERATURE).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
     
+    # НОВОЕ: Добавляем планировщик скорости обучения с разогревом
+    num_training_steps = len(dataloader) * EPOCHS
+    num_warmup_steps = int(0.1 * num_training_steps)  # 10% шагов на разогрев
+
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return 1.0  # После разогрева LR будет управляться оптимизатором
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
+    
     scaler = amp.GradScaler(enabled=(USE_AMP and device.type == 'cuda'))
 
     # Инициализация TensorBoard
@@ -151,6 +160,15 @@ def main():
                 continue
                 
             waveforms = waveforms.to(device)
+            
+            # НОВОЕ: Проверка данных на входе для диагностики
+            if i == 0 and epoch == 0:  # Только для первого батча первой эпохи
+                print(f"Диагностика данных:")
+                print(f"  Waveform shape: {waveforms.shape}")
+                print(f"  Waveform min/max: {waveforms.min():.4f}/{waveforms.max():.4f}")
+                print(f"  Waveform mean/std: {waveforms.mean():.4f}/{waveforms.std():.4f}")
+                print(f"  Non-zero elements: {(waveforms != 0).sum()}/{waveforms.numel()}")
+            
             optimizer.zero_grad(set_to_none=True)
             
             with amp.autocast(device_type=device_str, dtype=torch.float16, enabled=(USE_AMP and device.type == 'cuda')):
@@ -170,8 +188,16 @@ def main():
                 loss = criterion(transformer_masked_outputs.unsqueeze(0), projected_targets.unsqueeze(0))
 
             scaler.scale(loss).backward()
+            
+            # НОВОЕ: Клиппинг градиентов для стабилизации обучения
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
             scaler.step(optimizer)
             scaler.update()
+            
+            # НОВОЕ: Делаем шаг планировщика
+            scheduler.step()
             
             total_loss += loss.item()
             
@@ -183,7 +209,7 @@ def main():
             
             # Записываем в TensorBoard
             writer.add_scalar('Loss/Batch', loss.item(), global_step)
-            writer.add_scalar('Learning_Rate', LEARNING_RATE, global_step)
+            writer.add_scalar('Learning_Rate', scheduler.get_last_lr()[0], global_step)
             global_step += 1
 
         avg_loss = total_loss / len(dataloader)
