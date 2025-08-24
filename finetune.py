@@ -7,6 +7,7 @@ from pathlib import Path
 import torchaudio
 import pandas as pd
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder, CTClassificationHead, ASRModel
@@ -27,6 +28,9 @@ NUM_WORKERS = 4  # Количество воркеров для загрузки
 PIN_MEMORY = True  # Использовать закрепленную память для ускорения передачи на GPU
 PREFETCH_FACTOR = 2  # Количество батчей, предзагружаемых каждым воркером
 PERSISTENT_WORKERS = True  # Сохранять воркеров между эпохами
+
+# TensorBoard
+TENSORBOARD_LOG_DIR = "./runs/finetune"
 # =========================
 
 # Определяем словарь (важно, чтобы 0 был BLANK символом для CTC)
@@ -95,6 +99,21 @@ def main():
     criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
+    # Инициализация TensorBoard
+    writer = SummaryWriter(TENSORBOARD_LOG_DIR)
+    
+    # Записываем гиперпараметры
+    hparams = {
+        'batch_size': BATCH_SIZE,
+        'learning_rate': LEARNING_RATE,
+        'epochs': EPOCHS,
+        'num_workers': NUM_WORKERS,
+        'vocab_size': len(VOCAB)
+    }
+    writer.add_hparams(hparams, {'hparam/accuracy': 0.0})
+    
+    global_step = 0
+
     # 4. Цикл обучения
     # Общий прогресс-бар для всех эпох
     epoch_pbar = tqdm(range(EPOCHS), desc="Дообучение", unit="epoch")
@@ -135,8 +154,16 @@ def main():
                 'Loss': f'{loss.item():.4f}',
                 'Avg Loss': f'{total_loss / (i+1):.4f}'
             })
+            
+            # Записываем в TensorBoard
+            writer.add_scalar('Loss/Batch', loss.item(), global_step)
+            writer.add_scalar('Learning_Rate', LEARNING_RATE, global_step)
+            global_step += 1
 
         avg_loss = total_loss / len(dataloader)
+        
+        # Записываем средние потери за эпоху в TensorBoard
+        writer.add_scalar('Loss/Epoch', avg_loss, epoch + 1)
         
         # Обновляем общий прогресс-бар
         epoch_pbar.set_postfix({
@@ -147,6 +174,10 @@ def main():
     # Сохранение финальной модели
     torch.save(model.state_dict(), f"{SAVE_PATH}/finetuned_asr_model.pt")
     print(f"Финальная модель сохранена в {SAVE_PATH}/finetuned_asr_model.pt")
+
+    # Закрываем TensorBoard writer
+    writer.close()
+    print(f"TensorBoard логи сохранены в {TENSORBOARD_LOG_DIR}")
 
 if __name__ == "__main__":
     Path(SAVE_PATH).mkdir(exist_ok=True, parents=True)
