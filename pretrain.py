@@ -37,7 +37,7 @@ PREFETCH_FACTOR = 2  # Количество батчей, предзагружа
 PERSISTENT_WORKERS = True  # Сохранять воркеров между эпохами
 
 # TensorBoard
-TENSORBOARD_LOG_DIR = f"./runs/pretrain_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+TENSORBOARD_LOG_DIR = f"./runs/pretrain_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
 # =========================
 
 torch.manual_seed(SEED)
