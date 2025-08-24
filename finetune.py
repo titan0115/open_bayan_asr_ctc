@@ -8,6 +8,7 @@ import torchaudio
 import pandas as pd
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder, CTClassificationHead, ASRModel
@@ -30,7 +31,7 @@ PREFETCH_FACTOR = 2  # Количество батчей, предзагружа
 PERSISTENT_WORKERS = True  # Сохранять воркеров между эпохами
 
 # TensorBoard
-TENSORBOARD_LOG_DIR = "./runs/finetune"
+TENSORBOARD_LOG_DIR = f"./runs/finetune_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 # =========================
 
 # Определяем словарь (важно, чтобы 0 был BLANK символом для CTC)
@@ -99,6 +100,10 @@ def main():
     criterion = nn.CTCLoss(blank=0, reduction='mean', zero_infinity=True).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
 
+    # Создаем папку для логов TensorBoard
+    Path(TENSORBOARD_LOG_DIR).mkdir(parents=True, exist_ok=True)
+    print(f"TensorBoard логи будут сохранены в: {TENSORBOARD_LOG_DIR}")
+    
     # Инициализация TensorBoard
     writer = SummaryWriter(TENSORBOARD_LOG_DIR)
     

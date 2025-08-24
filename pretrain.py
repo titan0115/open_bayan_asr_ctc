@@ -10,6 +10,7 @@ import librosa
 import numpy as np
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
+from datetime import datetime
 
 # Импортируем наши модули
 from model import CustomSpeechEncoder
@@ -36,7 +37,7 @@ PREFETCH_FACTOR = 2  # Количество батчей, предзагружа
 PERSISTENT_WORKERS = True  # Сохранять воркеров между эпохами
 
 # TensorBoard
-TENSORBOARD_LOG_DIR = "./runs/pretrain"
+TENSORBOARD_LOG_DIR = f"./runs/pretrain_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
 # =========================
 
 torch.manual_seed(SEED)
@@ -204,6 +205,10 @@ def main():
     
     scaler = amp.GradScaler(enabled=(USE_AMP and device.type == 'cuda'))
 
+    # Создаем папку для логов TensorBoard
+    Path(TENSORBOARD_LOG_DIR).mkdir(parents=True, exist_ok=True)
+    print(f"TensorBoard логи будут сохранены в: {TENSORBOARD_LOG_DIR}")
+    
     # Инициализация TensorBoard
     writer = SummaryWriter(TENSORBOARD_LOG_DIR)
     
