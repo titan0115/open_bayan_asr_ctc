@@ -32,6 +32,10 @@ class CustomSpeechEncoder(nn.Module):
     def __init__(self, cnn_output_dim=512, d_model=768, n_head=12, n_layers=12, dim_feedforward=3072, dropout=0.1):
         super().__init__()
         
+        # НОВОЕ: Слой для нормализации входного сигнала
+        # Используем адаптивную нормализацию вместо фиксированной длины
+        self.waveform_norm = nn.LayerNorm(normalized_shape=1)  # Нормализуем по последнему измерению
+        
         self.feature_extractor = CNNFeatureExtractor(output_dim=cnn_output_dim)
         self.input_projection = nn.Linear(cnn_output_dim, d_model)
         self.positional_encoding = nn.Parameter(torch.zeros(1, 2048, d_model))
@@ -44,13 +48,23 @@ class CustomSpeechEncoder(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.layer_norm = nn.LayerNorm(d_model)
 
-    # <--- ИСПРАВЛЕНИЕ ЗДЕСЬ: Добавлен аргумент 'use_checkpointing'
     def forward(self, waveform: torch.Tensor, use_checkpointing: bool = False):
         """
         Args:
             waveform (Tensor): Входной аудиосигнал.
             use_checkpointing (bool): Флаг для активации gradient checkpointing.
         """
+        # НОВОЕ: Применяем нормализацию к waveform
+        # Нормализуем каждый пример в батче отдельно
+        if waveform.dim() == 2:
+            # [batch_size, seq_len] -> [batch_size, 1, seq_len] для LayerNorm
+            waveform = waveform.unsqueeze(1)
+            waveform = self.waveform_norm(waveform)
+            waveform = waveform.squeeze(1)  # Возвращаем к [batch_size, seq_len]
+        else:
+            # Если уже [batch_size, channels, seq_len]
+            waveform = self.waveform_norm(waveform)
+
         cnn_features = self.feature_extractor(waveform)
         
         x = cnn_features.transpose(1, 2)
