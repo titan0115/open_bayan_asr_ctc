@@ -28,6 +28,12 @@ TEMPERATURE = 0.1
 USE_AMP = True
 USE_CHECKPOINTING = True
 SEED = 42
+
+# Параметры загрузки данных
+NUM_WORKERS = 4  # Количество воркеров для загрузки данных
+PIN_MEMORY = True  # Использовать закрепленную память для ускорения передачи на GPU
+PREFETCH_FACTOR = 2  # Количество батчей, предзагружаемых каждым воркером
+PERSISTENT_WORKERS = True  # Сохранять воркеров между эпохами
 # =========================
 
 torch.manual_seed(SEED)
@@ -92,7 +98,11 @@ def main():
 
     dataset = UnsupervisedAudioDataset(Path(DATASET_PATH))
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                            collate_fn=collate_fn_pretrain, num_workers=4, pin_memory=True)
+                            collate_fn=collate_fn_pretrain, 
+                            num_workers=NUM_WORKERS, 
+                            pin_memory=PIN_MEMORY,
+                            prefetch_factor=PREFETCH_FACTOR,
+                            persistent_workers=PERSISTENT_WORKERS)
 
     model = CustomSpeechEncoder(d_model=D_MODEL, n_head=N_HEAD, n_layers=N_LAYERS).to(device)
 

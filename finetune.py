@@ -20,6 +20,12 @@ SAVE_PATH = "./finetuned_model"  # Папка для сохранения фин
 EPOCHS = 100  # Количество эпох
 BATCH_SIZE = 16  # Размер батча
 LEARNING_RATE = 3e-4  # Скорость обучения
+
+# Параметры загрузки данных
+NUM_WORKERS = 4  # Количество воркеров для загрузки данных
+PIN_MEMORY = True  # Использовать закрепленную память для ускорения передачи на GPU
+PREFETCH_FACTOR = 2  # Количество батчей, предзагружаемых каждым воркером
+PERSISTENT_WORKERS = True  # Сохранять воркеров между эпохами
 # =========================
 
 # Определяем словарь (важно, чтобы 0 был BLANK символом для CTC)
@@ -69,7 +75,11 @@ def main():
     dataset_path = Path(DATASET_PATH)
     dataset = SupervisedAudioDataset(dataset_path / 'metadata.csv', dataset_path / 'audio_files')
     dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, 
-                            collate_fn=collate_fn_finetune, num_workers=4)
+                            collate_fn=collate_fn_finetune, 
+                            num_workers=NUM_WORKERS,
+                            pin_memory=PIN_MEMORY,
+                            prefetch_factor=PREFETCH_FACTOR,
+                            persistent_workers=PERSISTENT_WORKERS)
 
     # 2. Модель
     encoder = CustomSpeechEncoder()
