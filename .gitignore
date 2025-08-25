@@ -6,3 +6,4 @@ runs/
 *.pth
 .venv/
 checkpoints/
+*.pt
