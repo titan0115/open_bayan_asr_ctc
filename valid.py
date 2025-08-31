@@ -13,7 +13,7 @@ from model import CustomSpeechEncoder, CTClassificationHead, ASRModel
 
 # ===== КОНФИГУРАЦИЯ =====
 DATASET_PATH = "./data"
-MODEL_PATH = "./finetuned_model/finetuned_asr_model.pt"
+MODEL_PATH = "./finetuned_model/finetuned_asr_model_epoch_10.pt"
 NUM_SAMPLES = 5  # Количество примеров для валидации
 SEED = 42
 
