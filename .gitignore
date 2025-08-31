@@ -7,3 +7,4 @@ runs/
 .venv/
 checkpoints/
 *.pt
+finetuned_model/
